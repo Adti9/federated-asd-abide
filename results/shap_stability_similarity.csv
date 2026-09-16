@@ -1,0 +1,4 @@
+setting_a,setting_b,cosine_similarity,pearson_correlation
+Centralized_Baseline,Federated_IID,1.0,1.0
+Centralized_Baseline,Federated_Site_NonIID,0.8454545454545455,0.8454545454545455
+Federated_IID,Federated_Site_NonIID,0.8454545454545455,0.8454545454545455

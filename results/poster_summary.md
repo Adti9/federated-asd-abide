@@ -1,4 +1,4 @@
-# Aavishkar Poster Summary
+# Poster Summary
 
 ## 1. Problem Statement & Core Research Goal
 

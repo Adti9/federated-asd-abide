@@ -1,0 +1,45 @@
+{
+  "dataset_shape": {
+    "rows": 1112,
+    "columns": 51
+  },
+  "diagnostic_test_instruments": [],
+  "dropped_columns": [
+    "DSM_IV_TR",
+    "ADI_R_SOCIAL_TOTAL_A",
+    "ADI_R_VERBAL_TOTAL_BV",
+    "ADI_R_ONSET_TOTAL_D",
+    "ADI_R_RSRCH_RELIABLE",
+    "ADOS_MODULE",
+    "ADOS_TOTAL",
+    "ADOS_COMM",
+    "ADOS_SOCIAL",
+    "ADOS_STEREO_BEHAV",
+    "ADOS_RSRCH_RELIABLE",
+    "ADOS_GOTHAM_SOCAFFECT",
+    "ADOS_GOTHAM_RRB",
+    "ADOS_GOTHAM_TOTAL",
+    "ADOS_GOTHAM_SEVERITY",
+    "SRS_VERSION",
+    "SRS_RAW_TOTAL",
+    "SRS_AWARENESS",
+    "SRS_COGNITION",
+    "SRS_COMMUNICATION",
+    "SRS_MOTIVATION",
+    "SRS_MANNERISMS",
+    "SCQ_TOTAL",
+    "AQ_TOTAL"
+  ],
+  "final_feature_list": [
+    "AGE_AT_SCAN",
+    "FIQ",
+    "VIQ",
+    "PIQ",
+    "SEX",
+    "HANDEDNESS_CATEGORY"
+  ],
+  "rationale": {
+    "diagnostic_test_instruments": "Explicitly removed because they are diagnosis-linked assessment instruments with structural missingness, post-diagnostic content, or direct measurement of ASD traits. Keeping them leaks the target label or creates outcome-dependent features.",
+    "structural_missingness": "These instruments are not consistently administered across all participants; in the ABIDE I phenotype table they show large blocks of missing values in control rows or diagnostic-specific subsets, making them invalid for general predictive modeling."
+  }
+}
