@@ -2,141 +2,146 @@ import os
 import sys
 
 import numpy as np
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, roc_auc_score
+import pandas as pd
+from sklearn.linear_model import SGDClassifier
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-from src.federated.dataset_partition import create_iid_partitions, create_site_non_iid_partitions
-
-
-class FederatedLogisticRegression:
-    def __init__(self, n_features):
-        self.coef_ = np.zeros((1, n_features), dtype=np.float64)
-        self.intercept_ = np.zeros(1, dtype=np.float64)
-
-    def get_parameters(self):
-        return self.coef_.copy(), self.intercept_.copy()
-
-    def set_parameters(self, coef, intercept):
-        self.coef_ = coef.copy()
-        self.intercept_ = intercept.copy()
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
+from src.preprocessing.clean_data import build_preprocessor
 
 
-def train_local_client(X_client, y_client):
-    """Fit a logistic regression on one client and return the local model params."""
-    if len(np.unique(y_client)) < 2:
-        return np.zeros((1, X_client.shape[1])), np.zeros(1), len(y_client)
+class IterativeFedAvgSimulation:
+    def __init__(self, num_rounds=10, local_epochs=1, lr=0.01, random_seed=42):
+        self.num_rounds = num_rounds
+        self.local_epochs = local_epochs
+        self.lr = lr
+        self.random_seed = random_seed
+        self.global_weights = None
+        self.global_intercept = None
 
-    model = LogisticRegression(max_iter=200, solver="liblinear", random_state=42)
-    model.fit(X_client, y_client)
-    return model.coef_.reshape(1, -1), model.intercept_.reshape(1), len(y_client)
+    def fit_evaluate(self, client_train_data, test_df, num_features, cat_features):
+        """
+        client_train_data: dict or list of raw dataframes per client (unpreprocessed)
+        test_df: raw dataframe for global evaluation
+        """
+        np.random.seed(self.random_seed)
 
+        if isinstance(client_train_data, dict):
+            client_train_data = list(client_train_data.values())
 
-def evaluate_global_model(global_model, X, y):
-    model = LogisticRegression(max_iter=200, solver="liblinear", random_state=42)
-    model.classes_ = np.array([0, 1])
-    model.coef_ = global_model.coef_.copy()
-    model.intercept_ = global_model.intercept_.copy()
-    preds = model.predict(X)
-    probs = model.predict_proba(X)[:, 1]
-    return accuracy_score(y, preds), roc_auc_score(y, probs)
+        normalized_clients = []
+        for client_raw in client_train_data:
+            if isinstance(client_raw, np.ndarray):
+                columns = list(test_df.columns)
+                client_raw = pd.DataFrame(client_raw, columns=columns)
+            normalized_clients.append(client_raw)
 
+        client_train_data = normalized_clients
 
-def run_fedavg_simulation(client_partitions, num_rounds=10):
-    """Run a FedAvg-like simulation and track model quality and communication overhead."""
-    if isinstance(client_partitions, dict):
-        clients_list = list(client_partitions.values())
-    else:
-        clients_list = client_partitions
+        # Fit a shared pooled feature schema for dimension alignment without using pooled statistics in training.
+        pooled_train_df = pd.concat(client_train_data, axis=0)
+        global_eval_preproc = build_preprocessor(num_features, cat_features)
+        X_train_global = global_eval_preproc.fit_transform(pooled_train_df[num_features + cat_features])
+        global_feature_names = global_eval_preproc.get_feature_names_out()
+        X_test_global = global_eval_preproc.transform(test_df[num_features + cat_features])
+        y_test_global = test_df["target"].values
 
-    sample_X = clients_list[0][0]
-    n_features = sample_X.shape[1]
-    global_model = FederatedLogisticRegression(n_features)
+        # 1. Fit local preprocessors independently per client to prevent cross-client leakage
+        client_processed = []
+        for client_raw in client_train_data:
+            preproc = build_preprocessor(num_features, cat_features)
+            X_c = preproc.fit_transform(client_raw[num_features + cat_features])
+            local_feature_names = preproc.get_feature_names_out()
 
-    log = []
-    total_upload_bytes = 0
-    total_download_bytes = 0
-    params_per_client = (n_features + 1) * 8
+            aligned_X = np.zeros((X_c.shape[0], X_train_global.shape[1]), dtype=np.float64)
+            for j, feat_name in enumerate(local_feature_names):
+                if feat_name in global_feature_names:
+                    aligned_X[:, np.where(global_feature_names == feat_name)[0][0]] = X_c[:, j]
 
-    all_X = np.vstack([client[0] for client in clients_list])
-    all_y = np.concatenate([client[1] for client in clients_list])
+            y_c = client_raw["target"].values
+            client_processed.append((aligned_X, y_c, preproc))
 
-    for round_idx in range(1, num_rounds + 1):
-        local_coefs = []
-        local_intercepts = []
-        sample_counts = []
+        n_features = X_train_global.shape[1]
 
-        for X_c, y_c in clients_list:
-            total_download_bytes += params_per_client
-            local_coef, local_intercept, count = train_local_client(X_c, y_c)
-            local_coefs.append(local_coef)
-            local_intercepts.append(local_intercept)
-            sample_counts.append(count)
-            total_upload_bytes += params_per_client
+        # Initialize Global Model Parameters
+        self.global_weights = np.zeros(n_features)
+        self.global_intercept = np.zeros(1)
 
-        total_samples = sum(sample_counts)
-        if total_samples == 0:
-            raise ValueError("No valid samples were found in the selected clients.")
+        param_count = n_features + 1
+        param_bytes = param_count * 8
 
-        new_coef = np.zeros_like(global_model.coef_)
-        new_intercept = np.zeros_like(global_model.intercept_)
-        for coef, intercept, count in zip(local_coefs, local_intercepts, sample_counts):
-            weight = count / total_samples
-            new_coef += coef * weight
-            new_intercept += intercept * weight
+        num_clients = len(client_processed)
+        total_upload_bytes = 0
+        total_download_bytes = 0
 
-        global_model.set_parameters(new_coef, new_intercept)
-        accuracy, roc_auc = evaluate_global_model(global_model, all_X, all_y)
+        # Iterative FedAvg Loop
+        for _ in range(self.num_rounds):
+            local_weights_list = []
+            local_intercept_list = []
+            sample_counts = []
 
-        round_bytes = total_upload_bytes + total_download_bytes
-        log.append(
-            {
-                "round": round_idx,
-                "accuracy": accuracy,
-                "roc_auc": roc_auc,
-                "upload_bytes": total_upload_bytes,
-                "download_bytes": total_download_bytes,
-                "total_bytes": round_bytes,
-            }
-        )
+            # Server sends current global model to all clients (Download)
+            total_download_bytes += num_clients * param_bytes
 
-        print(
-            f"Round {round_idx:02d} | Accuracy={accuracy:.4f} | ROC-AUC={roc_auc:.4f} | "
-            f"Upload={total_upload_bytes} bytes | Download={total_download_bytes} bytes | Total={round_bytes} bytes"
-        )
+            for X_c, y_c, _ in client_processed:
+                # Initialize SGD model with current global parameters
+                client_model = SGDClassifier(
+                    loss="log_loss",
+                    learning_rate="constant",
+                    eta0=self.lr,
+                    max_iter=1,
+                    warm_start=True,
+                    random_state=self.random_seed,
+                )
+                client_model.coef_ = self.global_weights.reshape(1, -1).copy()
+                client_model.intercept_ = self.global_intercept.copy()
 
-    final_metrics = log[-1]
-    return {
-        "final_accuracy": final_metrics["accuracy"],
-        "final_roc_auc": final_metrics["roc_auc"],
-        "total_upload_bytes": total_upload_bytes,
-        "total_download_bytes": total_download_bytes,
-        "total_communication_bytes": total_upload_bytes + total_download_bytes,
-        "round_metrics": log,
-    }
+                # Perform true local epochs as repeated partial-fit passes over the client's data.
+                if len(np.unique(y_c)) > 1:
+                    for _ in range(self.local_epochs):
+                        client_model.partial_fit(X_c, y_c, classes=np.array([0, 1]))
 
+                local_weights_list.append(client_model.coef_[0].copy())
+                local_intercept_list.append(client_model.intercept_[0])
+                sample_counts.append(len(y_c))
 
-def main():
-    print("=== Experiment A: Federated IID ===")
-    iid_partitions = create_iid_partitions(num_clients=5, random_seed=42)
-    iid_results = run_fedavg_simulation(iid_partitions, num_rounds=10)
+                # Client uploads updated parameters back to server
+                total_upload_bytes += param_bytes
 
-    print("\n=== Experiment B: Federated Site-based Non-IID ===")
-    non_iid_partitions = create_site_non_iid_partitions(min_samples=20)
-    non_iid_results = run_fedavg_simulation(non_iid_partitions, num_rounds=10)
+            # Weighted Aggregation (FedAvg)
+            total_samples = sum(sample_counts)
+            new_weights = np.zeros(n_features)
+            new_intercept = 0.0
 
-    print("\n=== Comparative Results ===")
-    for label, result in [("A (IID)", iid_results), ("B (Site Non-IID)", non_iid_results)]:
-        print(f"Experiment {label}:")
-        print(f"  Final Accuracy: {result['final_accuracy']:.4f}")
-        print(f"  Final ROC-AUC: {result['final_roc_auc']:.4f}")
-        print(f"  Total Upload Bytes: {result['total_upload_bytes']}")
-        print(f"  Total Download Bytes: {result['total_download_bytes']}")
-        print(f"  Total Communication Overhead: {result['total_communication_bytes']} bytes")
+            for idx in range(num_clients):
+                w_i = sample_counts[idx] / total_samples
+                new_weights += local_weights_list[idx] * w_i
+                new_intercept += local_intercept_list[idx] * w_i
 
+            self.global_weights = new_weights
+            self.global_intercept = np.array([new_intercept])
 
-if __name__ == "__main__":
-    main()
+        # 3. Final Global Model Evaluation on UNSEEN Global Test Set
+        eval_model = SGDClassifier(loss="log_loss", random_state=self.random_seed)
+        eval_model.classes_ = np.array([0, 1])
+        eval_model.coef_ = self.global_weights.reshape(1, -1)
+        eval_model.intercept_ = self.global_intercept
+
+        probs = eval_model.predict_proba(X_test_global)[:, 1]
+        preds = eval_model.predict(X_test_global)
+
+        return {
+            "roc_auc": roc_auc_score(y_test_global, probs),
+            "accuracy": accuracy_score(y_test_global, preds),
+            "precision": precision_score(y_test_global, preds, zero_division=0),
+            "recall": recall_score(y_test_global, preds, zero_division=0),
+            "f1": f1_score(y_test_global, preds, zero_division=0),
+            "total_comm_kb": (total_upload_bytes + total_download_bytes) / 1024.0,
+            "bytes_per_round_kb": ((num_clients * param_bytes * 2) / 1024.0),
+        }
